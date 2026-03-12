@@ -695,7 +695,13 @@ async function main(): Promise<void> {
         if (parent && (hasTrigger || !parentNeedsTrigger)) {
           const threadTs = chatJid.split(':t:')[1];
           const threadFolder = `${parent.folder}_t_${threadTs.replace('.', '_')}`;
-          storeChatMetadata(chatJid, new Date().toISOString(), `${parent.name} thread`, 'slack', false);
+          storeChatMetadata(
+            chatJid,
+            new Date().toISOString(),
+            `${parent.name} thread`,
+            'slack',
+            false,
+          );
           registerGroup(chatJid, {
             name: `${parent.name} thread`,
             folder: threadFolder,

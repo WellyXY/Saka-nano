@@ -34,11 +34,6 @@ import { AgentDefinition, RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
-export interface ImageAttachment {
-  path: string;
-  mediaType: string;
-}
-
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -47,7 +42,6 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
-  imageAttachments?: ImageAttachment[];
 }
 
 export interface ContainerOutput {
