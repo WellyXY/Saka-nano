@@ -112,6 +112,30 @@ function getAgentSkills(
 }
 
 /**
+ * Returns the list of universal skills from agents.json `_config.universalSkills`.
+ * These skills are always copied to every worker agent regardless of its own skill list.
+ */
+function getUniversalSkills(groupFolder: string): string[] {
+  const threadMatch = groupFolder.match(/^(.+)_t_\d+/);
+  const parentFolder = threadMatch ? threadMatch[1] : groupFolder;
+  const registryPath = path.join(GROUPS_DIR, parentFolder, 'agents.json');
+
+  try {
+    if (fs.existsSync(registryPath)) {
+      const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+      const config = registry._config;
+      if (config && Array.isArray(config.universalSkills)) {
+        return config.universalSkills;
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, registryPath }, 'Failed to read universalSkills from agents.json');
+  }
+
+  return [];
+}
+
+/**
  * After a worker container finishes, sync any NEW skills it created
  * back to the parent session and register them in agents.json.
  * This prevents skills created during a session from being lost.
@@ -260,14 +284,14 @@ function buildVolumeMounts(
 
   // Per-group Claude sessions directory.
   // Brain and non-thread groups use their own session folder.
-  // Thread workers with agentType get their OWN .claude/ (not parent's)
-  // so skill filtering doesn't destroy the parent's installed skills.
+  // Workers with agentType share a session folder per agent type so that
+  // the same agent retains its full conversation history across dispatches.
   // Thread workers without agentType share parent's .claude/ (legacy behavior).
   const threadMatch = group.folder.match(/^(.+)_t_\d+/);
   const parentSessionFolder = threadMatch ? threadMatch[1] : null;
   const sessionFolder =
     threadMatch && group.agentType
-      ? group.folder // agent workers get isolated session
+      ? `agent-${group.agentType}` // same agentType shares session across dispatches
       : parentSessionFolder || group.folder; // legacy: share parent
   const groupSessionsDir = path.join(
     DATA_DIR,
@@ -309,9 +333,17 @@ function buildVolumeMounts(
     : null;
   const skillsDst = path.join(groupSessionsDir, 'skills');
   const allowedSkills = getAgentSkills(group, isMain);
+  const universalSkills = getUniversalSkills(group.folder);
+
+  const shouldCopySkill = (skillDir: string): boolean => {
+    if (allowedSkills === null) return true;
+    if (allowedSkills.includes(skillDir)) return true;
+    if (universalSkills.includes(skillDir)) return true;
+    return false;
+  };
 
   if (!isMain && group.agentType) {
-    // Agent workers: build skills dir from parent + bundled, filtered by agent type
+    // Agent workers: build skills dir from parent + bundled, filtered by agent type + universal
     if (fs.existsSync(skillsDst)) {
       fs.rmSync(skillsDst, { recursive: true, force: true });
     }
@@ -322,7 +354,7 @@ function buildVolumeMounts(
       for (const skillDir of fs.readdirSync(parentSkillsSrc)) {
         const srcDir = path.join(parentSkillsSrc, skillDir);
         if (!fs.statSync(srcDir).isDirectory()) continue;
-        if (allowedSkills === null || allowedSkills.includes(skillDir)) {
+        if (shouldCopySkill(skillDir)) {
           fs.cpSync(srcDir, path.join(skillsDst, skillDir), {
             recursive: true,
           });
@@ -335,7 +367,7 @@ function buildVolumeMounts(
       for (const skillDir of fs.readdirSync(bundledSkillsSrc)) {
         const srcDir = path.join(bundledSkillsSrc, skillDir);
         if (!fs.statSync(srcDir).isDirectory()) continue;
-        if (allowedSkills === null || allowedSkills.includes(skillDir)) {
+        if (shouldCopySkill(skillDir)) {
           const dstDir = path.join(skillsDst, skillDir);
           if (!fs.existsSync(dstDir)) {
             fs.cpSync(srcDir, dstDir, { recursive: true });

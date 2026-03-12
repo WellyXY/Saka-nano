@@ -76,6 +76,10 @@ let messageLoopRunning = false;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
+// Per-agentType lock: prevents concurrent container runs for the same agent type
+// (they share a session directory and would conflict).
+const agentTypeLocks = new Map<string, Promise<void>>();
+
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -447,8 +451,48 @@ async function runAgent(
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
+  // Serialize same-agentType runs to avoid session directory conflicts
+  if (group.agentType) {
+    const existing = agentTypeLocks.get(group.agentType);
+    if (existing) {
+      logger.info(
+        { agentType: group.agentType },
+        'Waiting for previous agent of same type to finish',
+      );
+      await existing;
+    }
+  }
+
+  let releaseLock: (() => void) | undefined;
+  if (group.agentType) {
+    const lockPromise = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    agentTypeLocks.set(group.agentType, lockPromise);
+  }
+
+  try {
+    return await runAgentInner(group, prompt, chatJid, onOutput);
+  } finally {
+    if (group.agentType && releaseLock) {
+      agentTypeLocks.delete(group.agentType);
+      releaseLock();
+    }
+  }
+}
+
+async function runAgentInner(
+  group: RegisteredGroup,
+  prompt: string,
+  chatJid: string,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  // Workers with agentType share a single session across dispatches
+  const sessionKey = group.agentType
+    ? `agent:${group.agentType}`
+    : group.folder;
+  const sessionId = sessions[sessionKey];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -475,12 +519,14 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Persist session ID to both DB and an IPC backup file
-  const persistSession = (folder: string, sid: string) => {
-    sessions[folder] = sid;
-    setSession(folder, sid);
+  // Persist session ID to both DB and an IPC backup file.
+  // For agent-type workers, the key is `agent:{agentType}` so sessions
+  // survive across different thread dispatches of the same agent type.
+  const persistSession = (key: string, sid: string) => {
+    sessions[key] = sid;
+    setSession(key, sid);
     try {
-      const ipcDir = resolveGroupIpcPath(folder);
+      const ipcDir = resolveGroupIpcPath(group.folder);
       fs.writeFileSync(path.join(ipcDir, '.session'), sid);
     } catch {
       /* non-critical */
@@ -491,7 +537,7 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          persistSession(group.folder, output.newSessionId);
+          persistSession(sessionKey, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -514,7 +560,7 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      persistSession(group.folder, output.newSessionId);
+      persistSession(sessionKey, output.newSessionId);
     }
 
     if (output.status === 'error') {
