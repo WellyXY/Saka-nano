@@ -3,15 +3,22 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { DATA_DIR, GROUPS_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getTaskById,
+  storeChatMetadata,
+  storeMessage,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { NewMessage, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMessage: (jid: string, text: string) => Promise<string | void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -22,6 +29,7 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  enqueueMessageCheck: (jid: string) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -171,6 +179,22 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For dispatch_thread
+    description?: string;
+    agentType?: string;
+    // For register_agent
+    agentName?: string;
+    agentDisplayName?: string;
+    agentDescription?: string;
+    agentSkills?: string[];
+    agentTriggers?: string[];
+    // For request_collaboration
+    requesterFolder?: string;
+    targetAgent?: string;
+    task?: string;
+    // For nudge_agent
+    targetFolder?: string;
+    message?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -449,7 +473,357 @@ export async function processTaskIpc(
       }
       break;
 
+    case 'dispatch_thread':
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized dispatch_thread attempt blocked',
+        );
+        break;
+      }
+      if (data.chatJid && data.description && data.prompt && data.agentType) {
+        await handleDispatchThread(
+          data as {
+            chatJid: string;
+            description: string;
+            prompt: string;
+            agentType: string;
+          },
+          sourceGroup,
+          deps,
+        );
+      } else {
+        logger.warn(
+          { data },
+          'Invalid dispatch_thread - missing chatJid, description, prompt, or agentType',
+        );
+      }
+      break;
+
+    case 'register_agent':
+      if (data.agentName && data.agentDescription) {
+        handleRegisterAgent(
+          {
+            name: data.agentName,
+            displayName: data.agentDisplayName,
+            description: data.agentDescription,
+            skills: data.agentSkills || [],
+            triggers: data.agentTriggers || [],
+          },
+          sourceGroup,
+        );
+      } else {
+        logger.warn(
+          { data },
+          'Invalid register_agent - missing name or description',
+        );
+      }
+      break;
+
+    case 'request_collaboration':
+      if (data.targetAgent && data.task && data.requesterFolder) {
+        await handleCollaborationRequest(
+          {
+            chatJid: data.chatJid || '',
+            requesterFolder: data.requesterFolder,
+            targetAgent: data.targetAgent,
+            task: data.task,
+          },
+          sourceGroup,
+          deps,
+        );
+      } else {
+        logger.warn({ data }, 'Invalid request_collaboration - missing fields');
+      }
+      break;
+
+    case 'nudge_agent':
+      if (data.targetFolder && data.message) {
+        handleNudgeAgent(data.targetFolder, data.targetJid || '', data.message);
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
+}
+
+async function handleDispatchThread(
+  data: {
+    chatJid: string;
+    description: string;
+    prompt: string;
+    agentType: string;
+  },
+  sourceGroup: string,
+  deps: IpcDeps,
+): Promise<void> {
+  const registeredGroups = deps.registeredGroups();
+
+  const parentJid = data.chatJid.replace(/:t:.*$/, '');
+  const parent = registeredGroups[parentJid] || registeredGroups[data.chatJid];
+  if (!parent) {
+    logger.warn(
+      { chatJid: data.chatJid },
+      'dispatch_thread: parent group not found',
+    );
+    return;
+  }
+
+  const messageTs = await deps.sendMessage(
+    parentJid,
+    `📋 [${data.agentType}] ${data.description}`,
+  );
+
+  if (!messageTs) {
+    logger.error(
+      { chatJid: data.chatJid },
+      'dispatch_thread: failed to get message ts from channel',
+    );
+    return;
+  }
+
+  const channelId = parentJid.replace(/^slack:/, '');
+  const threadJid = `slack:${channelId}:t:${messageTs}`;
+  const threadFolder = `${parent.folder}_t_${messageTs.replace('.', '_')}`;
+
+  storeChatMetadata(
+    threadJid,
+    new Date().toISOString(),
+    undefined,
+    'slack',
+    false,
+  );
+
+  deps.registerGroup(threadJid, {
+    name: `${data.agentType} agent`,
+    folder: threadFolder,
+    trigger: parent.trigger,
+    added_at: new Date().toISOString(),
+    requiresTrigger: false,
+    isMain: false,
+    agentType: data.agentType,
+  });
+
+  const msg: NewMessage = {
+    id: `dispatch-${Date.now()}`,
+    chat_jid: threadJid,
+    sender: 'brain',
+    sender_name: 'Brain',
+    content: data.prompt,
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  };
+  storeMessage(msg);
+
+  deps.enqueueMessageCheck(threadJid);
+
+  logger.info(
+    {
+      threadJid,
+      threadFolder,
+      agentType: data.agentType,
+      description: data.description,
+    },
+    'dispatch_thread: agent dispatched',
+  );
+}
+
+/**
+ * Track pending collaboration requests so results can be routed back to the requester.
+ * Key: threadFolder of the dispatched collaborator
+ * Value: requesterFolder to relay results to
+ */
+const pendingCollaborations = new Map<string, string>();
+
+export function getCollaborationRequester(
+  threadFolder: string,
+): string | undefined {
+  return pendingCollaborations.get(threadFolder);
+}
+
+export function clearCollaboration(threadFolder: string): void {
+  pendingCollaborations.delete(threadFolder);
+}
+
+async function handleCollaborationRequest(
+  data: {
+    chatJid: string;
+    requesterFolder: string;
+    targetAgent: string;
+    task: string;
+  },
+  sourceGroup: string,
+  deps: IpcDeps,
+): Promise<void> {
+  const registeredGroups = deps.registeredGroups();
+
+  const parentFolder = sourceGroup.match(/^(.+?)_t_\d+/)?.[1] || sourceGroup;
+  const parentEntry = Object.entries(registeredGroups).find(
+    ([, g]) => g.folder === parentFolder,
+  );
+  if (!parentEntry) {
+    logger.warn(
+      { sourceGroup, parentFolder },
+      'request_collaboration: parent group not found',
+    );
+    return;
+  }
+
+  const [parentJid, parent] = parentEntry;
+
+  const agentDisplayName = data.targetAgent;
+  const description = `[collab] ${agentDisplayName}: ${data.task.slice(0, 80)}`;
+  const prompt = `${data.task}\n\n---\n这是来自另一个 agent 的协作请求。完成任务后，你的结果会自动转发给请求方。请直接输出结果，不需要额外确认。`;
+
+  const messageTs = await deps.sendMessage(
+    parentJid,
+    `🤝 [collaboration] ${agentDisplayName}: ${data.task.slice(0, 100)}`,
+  );
+
+  if (!messageTs) {
+    logger.error(
+      { parentJid },
+      'request_collaboration: failed to create thread',
+    );
+    return;
+  }
+
+  const channelId = parentJid.replace(/^slack:/, '');
+  const threadJid = `slack:${channelId}:t:${messageTs}`;
+  const threadFolder = `${parent.folder}_t_${messageTs.replace('.', '_')}`;
+
+  pendingCollaborations.set(threadFolder, data.requesterFolder);
+
+  storeChatMetadata(
+    threadJid,
+    new Date().toISOString(),
+    undefined,
+    'slack',
+    false,
+  );
+
+  deps.registerGroup(threadJid, {
+    name: `${agentDisplayName} agent (collab)`,
+    folder: threadFolder,
+    trigger: parent.trigger,
+    added_at: new Date().toISOString(),
+    requiresTrigger: false,
+    isMain: false,
+    agentType: data.targetAgent,
+  });
+
+  const msg: NewMessage = {
+    id: `collab-${Date.now()}`,
+    chat_jid: threadJid,
+    sender: 'collaboration',
+    sender_name: 'Collaboration Request',
+    content: prompt,
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  };
+  storeMessage(msg);
+
+  deps.enqueueMessageCheck(threadJid);
+
+  logger.info(
+    {
+      threadFolder,
+      requesterFolder: data.requesterFolder,
+      targetAgent: data.targetAgent,
+    },
+    'request_collaboration: agent dispatched, result will relay to requester',
+  );
+}
+
+function handleNudgeAgent(
+  targetFolder: string,
+  targetJid: string,
+  message: string,
+): void {
+  const targetInputDir = path.join(DATA_DIR, 'ipc', targetFolder, 'input');
+  if (!fs.existsSync(targetInputDir)) {
+    logger.warn(
+      { targetFolder },
+      'nudge_agent: target IPC input dir not found',
+    );
+    return;
+  }
+  const nudge = { type: 'message', text: message };
+  const filename = `${Date.now()}-nudge.json`;
+  fs.writeFileSync(path.join(targetInputDir, filename), JSON.stringify(nudge));
+  logger.info(
+    { targetFolder, targetJid, message },
+    'nudge_agent: message injected',
+  );
+}
+
+function handleRegisterAgent(
+  agent: {
+    name: string;
+    displayName?: string;
+    description: string;
+    skills: string[];
+    triggers: string[];
+  },
+  sourceGroup: string,
+): void {
+  const parentFolder = sourceGroup.match(/^(.+)_t_\d+/)?.[1] || sourceGroup;
+  const registryPath = path.join(GROUPS_DIR, parentFolder, 'agents.json');
+
+  let registry: Record<string, any> = {};
+  try {
+    if (fs.existsSync(registryPath)) {
+      registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+    }
+  } catch (err) {
+    logger.warn(
+      { err, registryPath },
+      'Failed to read agents.json for register_agent',
+    );
+  }
+
+  if (registry[agent.name]) {
+    logger.info(
+      { agentName: agent.name },
+      'register_agent: updating existing agent',
+    );
+  }
+
+  const entry: Record<string, any> = {
+    description: agent.description,
+    skills: agent.skills,
+    triggers: agent.triggers,
+  };
+  if (agent.displayName) {
+    entry.name = agent.displayName;
+    if (!entry.triggers.includes(agent.displayName.toLowerCase())) {
+      entry.triggers.push(agent.displayName.toLowerCase());
+    }
+  }
+  registry[agent.name] = entry;
+
+  fs.writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
+
+  const agentMemoryDir = path.join(GROUPS_DIR, 'agents', agent.name);
+  fs.mkdirSync(agentMemoryDir, { recursive: true });
+  const claudeMd = path.join(agentMemoryDir, 'CLAUDE.md');
+  const heading = agent.displayName
+    ? `# ${agent.displayName} — ${agent.name.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}`
+    : `# ${agent.name}`;
+  if (!fs.existsSync(claudeMd)) {
+    fs.writeFileSync(claudeMd, `${heading}\n\n${agent.description}\n`);
+  }
+
+  logger.info(
+    {
+      agentName: agent.name,
+      displayName: agent.displayName,
+      skills: agent.skills,
+      triggers: agent.triggers,
+    },
+    'register_agent: new agent registered',
+  );
 }

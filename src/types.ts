@@ -40,6 +40,13 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  agentType?: string; // Agent type for dispatched workers (e.g. "ref-video", "general")
+}
+
+export interface AgentDefinition {
+  description: string;
+  skills: string[];
+  triggers: string[];
 }
 
 export interface NewMessage {
@@ -82,7 +89,7 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string): Promise<string | void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

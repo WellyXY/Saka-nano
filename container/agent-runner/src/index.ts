@@ -49,7 +49,7 @@ interface SessionsIndex {
 
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: string | ContentBlock[] };
   parent_tool_use_id: null;
   session_id: string;
 }
@@ -71,6 +71,16 @@ class MessageStream {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
+      parent_tool_use_id: null,
+      session_id: '',
+    });
+    this.waiting?.();
+  }
+
+  pushMultimodal(content: ContentBlock[]): void {
+    this.queue.push({
+      type: 'user',
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -340,6 +350,25 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
+  // Load image attachments and send as multimodal content blocks
+  if (containerInput.imageAttachments?.length) {
+    const blocks: ContentBlock[] = [];
+    for (const img of containerInput.imageAttachments) {
+      try {
+        if (fs.existsSync(img.path)) {
+          const data = fs.readFileSync(img.path).toString('base64');
+          blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data } });
+          log(`Loaded image: ${img.path} (${img.mediaType})`);
+        }
+      } catch (err) {
+        log(`Failed to load image: ${img.path}`);
+      }
+    }
+    if (blocks.length > 0) {
+      stream.pushMultimodal(blocks);
+    }
+  }
+
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
@@ -366,22 +395,57 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  // Load role-specific system context:
+  // - Main agent: brain-mode.md (plan-only, dispatch tasks to threads)
+  // - Non-main agents: global CLAUDE.md (shared rules for all groups)
   let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+  if (containerInput.isMain) {
+    const brainModePath = '/workspace/group/brain-mode.md';
+    if (fs.existsSync(brainModePath)) {
+      globalClaudeMd = fs.readFileSync(brainModePath, 'utf-8');
+    }
+  } else {
+    const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+    if (fs.existsSync(globalClaudeMdPath)) {
+      globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+    }
+    // Replace default name with agent-specific name
+    if (globalClaudeMd && containerInput.assistantName) {
+      globalClaudeMd = globalClaudeMd.replace(/^# Andy\b/m, `# ${containerInput.assistantName}`);
+      globalClaudeMd = globalClaudeMd.replace(
+        /You are Andy, a personal assistant\./,
+        `You are ${containerInput.assistantName}. You are a specialized agent in an AI agency.`,
+      );
+    }
+    // Inject agent-specific memory into system prompt so it has high priority
+    const agentMemoryPath = '/workspace/agent-memory/CLAUDE.md';
+    if (fs.existsSync(agentMemoryPath)) {
+      const agentMemory = fs.readFileSync(agentMemoryPath, 'utf-8');
+      globalClaudeMd = globalClaudeMd
+        ? `${globalClaudeMd}\n\n---\n\n${agentMemory}`
+        : agentMemory;
+      log(`Agent memory injected into system prompt (${agentMemory.length} chars)`);
+    }
   }
 
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
+  log(`System prompt mode: ${containerInput.isMain ? 'BRAIN (custom)' : 'worker (preset+append)'}, loaded: ${!!globalClaudeMd}, length: ${globalClaudeMd?.length ?? 0}`);
+
+  // Discover additional directories for SDK to load CLAUDE.md from
   const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
+  for (const base of ['/workspace/extra', '/workspace/agent-memory', '/workspace/agents']) {
+    if (!fs.existsSync(base)) continue;
+    const stat = fs.statSync(base);
+    if (stat.isDirectory()) {
+      // If the directory itself has CLAUDE.md, add it directly
+      if (fs.existsSync(path.join(base, 'CLAUDE.md'))) {
+        extraDirs.push(base);
+      }
+      // Also scan subdirectories (for /workspace/extra/* and /workspace/agents/*)
+      for (const entry of fs.readdirSync(base)) {
+        const fullPath = path.join(base, entry);
+        if (fs.statSync(fullPath).isDirectory()) {
+          extraDirs.push(fullPath);
+        }
       }
     }
   }
@@ -393,22 +457,30 @@ async function runQuery(
     prompt: stream,
     options: {
       cwd: '/workspace/group',
+      model: process.env.CLAUDE_MODEL || undefined,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
       systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+        ? (containerInput.isMain
+            ? globalClaudeMd
+            : { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd })
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
+      allowedTools: containerInput.isMain
+        ? [
+            'TodoWrite',
+            'mcp__nanoclaw__*',
+          ]
+        : [
+            'Bash',
+            'Read', 'Write', 'Edit', 'Glob', 'Grep',
+            'WebSearch', 'WebFetch',
+            'Task', 'TaskOutput', 'TaskStop',
+            'TeamCreate', 'TeamDelete', 'SendMessage',
+            'TodoWrite', 'ToolSearch', 'Skill',
+            'NotebookEdit',
+            'mcp__nanoclaw__*',
+          ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,

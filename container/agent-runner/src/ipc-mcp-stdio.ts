@@ -333,6 +333,249 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+server.tool(
+  'dispatch_thread',
+  `Dispatch a task to a specific agent for isolated execution in a new Slack thread.
+Each agent has its own skills and memory. Choose the right agent_type based on the task.
+
+Available agents are listed in your system prompt. Use "general" for tasks that don't match any specialist agent.
+
+You are the brain — plan and dispatch, never execute.`,
+  {
+    agent_type: z.string().describe('Agent type to dispatch to (e.g. "ref-video", "content-generate", "general")'),
+    description: z.string().describe('Short task summary (displayed as thread header message)'),
+    prompt: z.string().describe('Full task instructions for the agent. Include all necessary context — the agent has no access to this conversation.'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main (brain) agent can dispatch threads.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'dispatch_thread',
+      chatJid,
+      agentType: args.agent_type,
+      description: args.description,
+      prompt: args.prompt,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Dispatched to [${args.agent_type}] agent: "${args.description}". Results will be relayed back to you.` }],
+    };
+  },
+);
+
+server.tool(
+  'register_agent',
+  `Register a new agent type in the agency. Only the HR agent (or brain) should use this.
+Creates the agent definition so it can be dispatched to in the future.
+The new agent will have its own isolated memory and the specified skills.`,
+  {
+    name: z.string().describe('Agent identifier (lowercase, hyphenated, e.g. "data-analyst")'),
+    displayName: z.string().describe('Human-readable name for this agent (e.g. "Saga", "Muse"). Used as the agent\'s identity.'),
+    description: z.string().describe('What this agent does (shown to the brain for dispatch decisions)'),
+    skills: z.array(z.string()).describe('List of skill names this agent should have access to'),
+    triggers: z.array(z.string()).describe('Keywords that help the brain identify when to dispatch to this agent'),
+  },
+  async (args) => {
+    const data = {
+      type: 'register_agent',
+      agentName: args.name,
+      agentDisplayName: args.displayName,
+      agentDescription: args.description,
+      agentSkills: args.skills,
+      agentTriggers: args.triggers,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Agent "${args.name}" registered. The brain can now dispatch tasks to it.` }],
+    };
+  },
+);
+
+server.tool(
+  'request_collaboration',
+  `Request another agent to perform a task and return results to you.
+Use when you need data or work from a specialist agent (e.g. ask Echo for social media data, ask Muse to generate content).
+
+The target agent will be dispatched automatically. When it finishes, its result will be sent back to your conversation so you can continue.
+
+You should continue working on other parts of your task while waiting. The result will arrive as a new message.`,
+  {
+    target_agent: z.string().describe('Agent type to request help from (e.g. "social-media-manager", "content-creator", "dev", "researcher")'),
+    task: z.string().describe('What you need the agent to do. Be specific — include all context needed.'),
+  },
+  async (args) => {
+    const data = {
+      type: 'request_collaboration',
+      chatJid,
+      requesterFolder: groupFolder,
+      targetAgent: args.target_agent,
+      task: args.task,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Collaboration request sent to [${args.target_agent}]. Continue working — their result will arrive as a message when ready.` }],
+    };
+  },
+);
+
+// Brain-only: check status of dispatched agents
+if (isMain) {
+  server.tool(
+    'check_agents',
+    `Check the real-time status of all agent containers and dispatched threads.
+Shows which agents are running, completed, or dead.
+Use this when agents haven't responded or you want to monitor progress.`,
+    {},
+    async () => {
+      const statusPath = path.join(IPC_DIR, 'container_status.json');
+      const inputDir = path.join(IPC_DIR, 'input');
+
+      // Read comprehensive status from health monitor
+      let status: {
+        timestamp?: string;
+        runningContainers?: string[];
+        activeContainers?: Array<{
+          containerName: string | null;
+          groupFolder: string | null;
+          active: boolean;
+          idleWaiting: boolean;
+          isWorker: boolean;
+          alive: boolean;
+        }>;
+        threadGroups?: Array<{
+          folder: string;
+          name: string;
+          agentType?: string;
+          hasContainer: boolean;
+        }>;
+      } = {};
+      try {
+        if (fs.existsSync(statusPath)) {
+          status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
+        }
+      } catch {}
+
+      // Check IPC input dir for pending messages
+      let pendingCount = 0;
+      try {
+        if (fs.existsSync(inputDir)) {
+          pendingCount = fs.readdirSync(inputDir).filter(f => f.endsWith('.json')).length;
+        }
+      } catch {}
+
+      const lines: string[] = ['## Agent Status Report'];
+      if (status.timestamp) {
+        lines.push(`Last updated: ${status.timestamp}`);
+      }
+      lines.push('');
+
+      // Running containers
+      const containers = status.runningContainers || [];
+      lines.push(`### Running Containers (${containers.length})`);
+      if (containers.length > 0) {
+        for (const c of containers) {
+          lines.push(`- 🟢 ${c}`);
+        }
+      } else {
+        lines.push('- None');
+      }
+      lines.push('');
+
+      // Active containers with queue tracking
+      const active = status.activeContainers || [];
+      if (active.length > 0) {
+        lines.push(`### Queue-tracked Containers (${active.length})`);
+        for (const c of active) {
+          const emoji = c.alive ? '🟢' : '🔴';
+          const type = c.isWorker ? 'worker' : 'brain';
+          const idle = c.idleWaiting ? ' (idle)' : '';
+          lines.push(`- ${emoji} ${c.containerName || 'unknown'} [${type}]${idle}`);
+        }
+        lines.push('');
+      }
+
+      // Thread groups (dispatched agents)
+      const threads = status.threadGroups || [];
+      if (threads.length > 0) {
+        lines.push(`### Dispatched Agent Threads (${threads.length})`);
+        for (const t of threads.slice(-20)) {
+          const emoji = t.hasContainer ? '🟢 running' : '⚪ completed';
+          const agentLabel = t.agentType ? `[${t.agentType}]` : '';
+          lines.push(`- ${emoji} ${t.name} ${agentLabel}`);
+        }
+        lines.push('');
+      }
+
+      lines.push(`### Pending IPC messages for you: ${pendingCount}`);
+
+      if (active.some(c => !c.alive)) {
+        lines.push('');
+        lines.push('⚠️ Dead containers detected — health monitor will auto-clean.');
+      }
+
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    },
+  );
+
+  server.tool(
+    'retry_agent',
+    `Restart a stuck or failed agent by sending it a nudge message.
+Use when an agent hasn't responded after being dispatched.`,
+    {
+      agent_type: z.string().describe('The agent_type that is stuck (e.g. "hr", "general")'),
+      message: z.string().describe('Message to send to the agent, e.g. "请立即完成你的任务并回复"').default('请立即完成你的任务并回复结果。'),
+    },
+    async (args) => {
+      // Find the thread folder for this agent type
+      const availableGroupsPath = path.join(IPC_DIR, 'available_groups.json');
+      let groups: Array<{ jid: string; name: string; folder: string }> = [];
+      try {
+        if (fs.existsSync(availableGroupsPath)) {
+          groups = JSON.parse(fs.readFileSync(availableGroupsPath, 'utf-8'));
+        }
+      } catch {}
+
+      const match = groups.find(g => g.name.toLowerCase().includes(args.agent_type.toLowerCase()));
+      if (!match) {
+        return { content: [{ type: 'text' as const, text: `No active thread found for agent type "${args.agent_type}". It may not have been dispatched yet.` }] };
+      }
+
+      // Write a nudge message to the agent's IPC input
+      const agentInputDir = `/workspace/ipc/../ipc-nudge`;
+      const data = {
+        type: 'nudge_agent',
+        targetFolder: match.folder,
+        targetJid: match.jid,
+        message: args.message,
+        groupFolder,
+        timestamp: new Date().toISOString(),
+      };
+
+      writeIpcFile(TASKS_DIR, data);
+
+      return {
+        content: [{ type: 'text' as const, text: `Sent nudge to ${match.name} (${match.folder}): "${args.message}"` }],
+      };
+    },
+  );
+}
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

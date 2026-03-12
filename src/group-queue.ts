@@ -3,6 +3,10 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import {
+  listRunningContainers,
+  stopContainerAsync,
+} from './container-runtime.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -34,6 +38,9 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  private statusIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  private activeWorkers = new Set<string>();
+  private brainJid: string | null = null;
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -57,6 +64,26 @@ export class GroupQueue {
 
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  setBrainJid(jid: string): void {
+    this.brainJid = jid;
+  }
+
+  trackWorker(groupJid: string, active: boolean): void {
+    if (active) {
+      this.activeWorkers.add(groupJid);
+    } else {
+      this.activeWorkers.delete(groupJid);
+    }
+    logger.debug(
+      { groupJid, active, count: this.activeWorkers.size },
+      'Worker tracking updated',
+    );
+  }
+
+  hasActiveWorkers(): boolean {
+    return this.activeWorkers.size > 0;
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -141,6 +168,31 @@ export class GroupQueue {
     if (groupFolder) state.groupFolder = groupFolder;
   }
 
+  private clearStatusInterval(groupJid: string): void {
+    const interval = this.statusIntervals.get(groupJid);
+    if (interval) {
+      clearInterval(interval);
+      this.statusIntervals.delete(groupJid);
+    }
+  }
+
+  startStatusInterval(
+    groupJid: string,
+    onTick: (elapsedMs: number) => void,
+  ): void {
+    this.clearStatusInterval(groupJid);
+    const startTime = Date.now();
+    const interval = setInterval(() => {
+      const state = this.getGroup(groupJid);
+      if (!state.active) {
+        this.clearStatusInterval(groupJid);
+        return;
+      }
+      onTick(Date.now() - startTime);
+    }, 60_000);
+    this.statusIntervals.set(groupJid, interval);
+  }
+
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
@@ -157,9 +209,13 @@ export class GroupQueue {
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
    */
-  sendMessage(groupJid: string, text: string): boolean {
+  sendMessage(groupJid: string, text: string, force = false): boolean {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer)
+    if (
+      !state.active ||
+      !state.groupFolder ||
+      (!force && state.isTaskContainer)
+    )
       return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
 
@@ -222,6 +278,7 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
+      this.clearStatusInterval(groupJid);
       state.active = false;
       state.process = null;
       state.containerName = null;
@@ -249,6 +306,7 @@ export class GroupQueue {
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
+      this.clearStatusInterval(groupJid);
       state.active = false;
       state.isTaskContainer = false;
       state.runningTaskId = null;
@@ -344,8 +402,104 @@ export class GroupQueue {
     }
   }
 
+  /**
+   * Get a snapshot of all tracked containers and their status.
+   * Used by the health monitor and check_agents tool.
+   */
+  getTrackedContainers(): Array<{
+    groupJid: string;
+    containerName: string | null;
+    groupFolder: string | null;
+    active: boolean;
+    idleWaiting: boolean;
+    isWorker: boolean;
+  }> {
+    const result: Array<{
+      groupJid: string;
+      containerName: string | null;
+      groupFolder: string | null;
+      active: boolean;
+      idleWaiting: boolean;
+      isWorker: boolean;
+    }> = [];
+    for (const [jid, state] of this.groups) {
+      if (state.active) {
+        result.push({
+          groupJid: jid,
+          containerName: state.containerName,
+          groupFolder: state.groupFolder,
+          active: state.active,
+          idleWaiting: state.idleWaiting,
+          isWorker: this.activeWorkers.has(jid),
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Health check: compare tracked containers against actually running containers.
+   * Returns list of containers that are tracked but NOT running (zombies).
+   */
+  healthCheck(): Array<{
+    groupJid: string;
+    containerName: string;
+    groupFolder: string | null;
+  }> {
+    const running = new Set(listRunningContainers());
+    const zombies: Array<{
+      groupJid: string;
+      containerName: string;
+      groupFolder: string | null;
+    }> = [];
+
+    for (const [jid, state] of this.groups) {
+      if (
+        state.active &&
+        state.containerName &&
+        !running.has(state.containerName)
+      ) {
+        zombies.push({
+          groupJid: jid,
+          containerName: state.containerName,
+          groupFolder: state.groupFolder,
+        });
+      }
+    }
+    return zombies;
+  }
+
+  /**
+   * Force-release a tracked group that is no longer running.
+   * Resets its state so the slot is freed and pending work can proceed.
+   */
+  forceRelease(groupJid: string): void {
+    const state = this.groups.get(groupJid);
+    if (!state || !state.active) return;
+
+    logger.info(
+      { groupJid, containerName: state.containerName },
+      'Force-releasing dead container slot',
+    );
+
+    this.clearStatusInterval(groupJid);
+    state.active = false;
+    state.idleWaiting = false;
+    state.process = null;
+    state.containerName = null;
+    state.groupFolder = null;
+    state.isTaskContainer = false;
+    state.runningTaskId = null;
+    this.activeCount--;
+    this.activeWorkers.delete(groupJid);
+    this.drainWaiting();
+  }
+
   async shutdown(_gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
+    for (const groupJid of this.statusIntervals.keys()) {
+      this.clearStatusInterval(groupJid);
+    }
 
     // Count active containers but don't kill them — they'll finish on their own
     // via idle timeout or container timeout. The --rm flag cleans them up on exit.

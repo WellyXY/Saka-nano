@@ -1,0 +1,90 @@
+# LiteLLM Proxy Config — routes Anthropic-format requests to GMI Cloud
+# Start with: litellm --config litellm-config.yaml --port 4000
+
+model_list:
+  # SDK default model names — the SDK sends these exact names
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4.5
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4.5
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  # Haiku — used by SDK subagents (Task tool). GMI has no Haiku, map to Sonnet 4.
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  - model_name: haiku
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  # Friendly names (set via CLAUDE_MODEL in .env)
+  - model_name: claude-opus-4.5
+    litellm_params:
+      model: gmi/anthropic/claude-opus-4.5
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  - model_name: claude-opus-4
+    litellm_params:
+      model: gmi/anthropic/claude-opus-4
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  - model_name: claude-sonnet-4.5
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4.5
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  - model_name: claude-sonnet-4
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  # Catch other common SDK aliases
+  - model_name: sonnet
+    litellm_params:
+      model: gmi/anthropic/claude-sonnet-4.5
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+  - model_name: opus
+    litellm_params:
+      model: gmi/anthropic/claude-opus-4.5
+      api_key: os.environ/GMI_API_KEY
+      extra_headers:
+        User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 300
+  num_retries: 3
+  retry_after: 5

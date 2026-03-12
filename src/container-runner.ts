@@ -16,6 +16,7 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -27,11 +28,16 @@ import {
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
-import { RegisteredGroup } from './types.js';
+import { AgentDefinition, RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+export interface ImageAttachment {
+  path: string;
+  mediaType: string;
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -41,6 +47,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  imageAttachments?: ImageAttachment[];
 }
 
 export interface ContainerOutput {
@@ -56,6 +63,147 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+/**
+ * Returns the display name for a group's agent type from agents.json.
+ */
+function getAgentName(group: RegisteredGroup): string | null {
+  if (!group.agentType) return null;
+  const threadMatch = group.folder.match(/^(.+)_t_\d+/);
+  const parentFolder = threadMatch ? threadMatch[1] : group.folder;
+  const registryPath = path.join(GROUPS_DIR, parentFolder, 'agents.json');
+  try {
+    if (fs.existsSync(registryPath)) {
+      const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+      return registry[group.agentType]?.name || null;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Returns the skill list for a group's agent type. null = all skills (general agent).
+ * Brain agents return empty array (no skills).
+ */
+function getAgentSkills(
+  group: RegisteredGroup,
+  isMain: boolean,
+): string[] | null {
+  if (isMain) return [];
+  if (!group.agentType || group.agentType === 'general') return null;
+
+  // Try loading agent registry from the parent group's folder
+  const threadMatch = group.folder.match(/^(.+)_t_\d+/);
+  const parentFolder = threadMatch ? threadMatch[1] : group.folder;
+  const registryPath = path.join(GROUPS_DIR, parentFolder, 'agents.json');
+
+  try {
+    if (fs.existsSync(registryPath)) {
+      const registry: Record<string, AgentDefinition> = JSON.parse(
+        fs.readFileSync(registryPath, 'utf-8'),
+      );
+      const def = registry[group.agentType];
+      if (def && def.skills.length > 0) return def.skills;
+    }
+  } catch (err) {
+    logger.warn({ err, registryPath }, 'Failed to read agents.json');
+  }
+
+  return null;
+}
+
+/**
+ * After a worker container finishes, sync any NEW skills it created
+ * back to the parent session and register them in agents.json.
+ * This prevents skills created during a session from being lost.
+ */
+export function syncWorkerSkillsBack(group: RegisteredGroup): void {
+  if (group.isMain || !group.agentType) return;
+
+  const threadMatch = group.folder.match(/^(.+)_t_\d+/);
+  if (!threadMatch) return;
+
+  const parentFolder = threadMatch[1];
+  const workerSkillsDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    '.claude',
+    'skills',
+  );
+  const parentSkillsDir = path.join(
+    DATA_DIR,
+    'sessions',
+    parentFolder,
+    '.claude',
+    'skills',
+  );
+
+  if (!fs.existsSync(workerSkillsDir)) return;
+
+  const workerSkills = fs
+    .readdirSync(workerSkillsDir)
+    .filter((d) => fs.statSync(path.join(workerSkillsDir, d)).isDirectory());
+  const parentSkills = new Set(
+    fs.existsSync(parentSkillsDir)
+      ? fs
+          .readdirSync(parentSkillsDir)
+          .filter((d) =>
+            fs.statSync(path.join(parentSkillsDir, d)).isDirectory(),
+          )
+      : [],
+  );
+
+  const newSkills: string[] = [];
+  for (const skill of workerSkills) {
+    if (!parentSkills.has(skill)) {
+      const src = path.join(workerSkillsDir, skill);
+      const dst = path.join(parentSkillsDir, skill);
+      try {
+        fs.mkdirSync(parentSkillsDir, { recursive: true });
+        fs.cpSync(src, dst, { recursive: true });
+        newSkills.push(skill);
+      } catch (err) {
+        logger.warn(
+          { err, skill },
+          'Failed to sync worker skill back to parent',
+        );
+      }
+    }
+  }
+
+  if (newSkills.length === 0) return;
+
+  // Also register new skills in agents.json so future workers of this type get them
+  const registryPath = path.join(GROUPS_DIR, parentFolder, 'agents.json');
+  try {
+    if (fs.existsSync(registryPath)) {
+      const registry: Record<string, AgentDefinition> = JSON.parse(
+        fs.readFileSync(registryPath, 'utf-8'),
+      );
+      const def = registry[group.agentType];
+      if (def) {
+        const existing = new Set(def.skills);
+        for (const skill of newSkills) {
+          if (!existing.has(skill)) {
+            def.skills.push(skill);
+          }
+        }
+        fs.writeFileSync(
+          registryPath,
+          JSON.stringify(registry, null, 2) + '\n',
+        );
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to update agents.json with new skills');
+  }
+
+  logger.info(
+    { agent: group.agentType, newSkills },
+    'Synced worker-created skills back to parent session',
+  );
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
@@ -63,6 +211,13 @@ function buildVolumeMounts(
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
+
+  // Thread groups share their parent's group folder so they inherit
+  // CLAUDE.md (group memory), conversations/, and other persistent data.
+  const threadFolderMatch = group.folder.match(/^(.+)_t_\d+/);
+  const parentGroupDir = threadFolderMatch
+    ? resolveGroupFolderPath(threadFolderMatch[1])
+    : null;
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
@@ -76,17 +231,6 @@ function buildVolumeMounts(
       readonly: true,
     });
 
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the credential proxy, never exposed to containers.
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
-
     // Main also gets its group folder as the working directory
     mounts.push({
       hostPath: groupDir,
@@ -94,9 +238,10 @@ function buildVolumeMounts(
       readonly: false,
     });
   } else {
-    // Other groups only get their own folder
+    // Thread groups mount the parent's group folder so they share memory.
+    // Non-thread groups mount their own folder.
     mounts.push({
-      hostPath: groupDir,
+      hostPath: parentGroupDir || groupDir,
       containerPath: '/workspace/group',
       readonly: false,
     });
@@ -113,12 +258,21 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
+  // Per-group Claude sessions directory.
+  // Brain and non-thread groups use their own session folder.
+  // Thread workers with agentType get their OWN .claude/ (not parent's)
+  // so skill filtering doesn't destroy the parent's installed skills.
+  // Thread workers without agentType share parent's .claude/ (legacy behavior).
+  const threadMatch = group.folder.match(/^(.+)_t_\d+/);
+  const parentSessionFolder = threadMatch ? threadMatch[1] : null;
+  const sessionFolder =
+    threadMatch && group.agentType
+      ? group.folder // agent workers get isolated session
+      : parentSessionFolder || group.folder; // legacy: share parent
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
-    group.folder,
+    sessionFolder,
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
@@ -146,22 +300,113 @@ function buildVolumeMounts(
     );
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  // Sync skills: workers get a filtered copy from the parent session's skills.
+  // The parent session (e.g. slack_main) holds the master set of installed skills.
+  // container/skills/ provides bundled skills (e.g. agent-browser).
+  const bundledSkillsSrc = path.join(process.cwd(), 'container', 'skills');
+  const parentSkillsSrc = parentSessionFolder
+    ? path.join(DATA_DIR, 'sessions', parentSessionFolder, '.claude', 'skills')
+    : null;
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+  const allowedSkills = getAgentSkills(group, isMain);
+
+  if (!isMain && group.agentType) {
+    // Agent workers: build skills dir from parent + bundled, filtered by agent type
+    if (fs.existsSync(skillsDst)) {
+      fs.rmSync(skillsDst, { recursive: true, force: true });
+    }
+    fs.mkdirSync(skillsDst, { recursive: true });
+
+    // Copy from parent session skills (the master set)
+    if (parentSkillsSrc && fs.existsSync(parentSkillsSrc)) {
+      for (const skillDir of fs.readdirSync(parentSkillsSrc)) {
+        const srcDir = path.join(parentSkillsSrc, skillDir);
+        if (!fs.statSync(srcDir).isDirectory()) continue;
+        if (allowedSkills === null || allowedSkills.includes(skillDir)) {
+          fs.cpSync(srcDir, path.join(skillsDst, skillDir), {
+            recursive: true,
+          });
+        }
+      }
+    }
+
+    // Also copy from bundled skills (container/skills/)
+    if (fs.existsSync(bundledSkillsSrc)) {
+      for (const skillDir of fs.readdirSync(bundledSkillsSrc)) {
+        const srcDir = path.join(bundledSkillsSrc, skillDir);
+        if (!fs.statSync(srcDir).isDirectory()) continue;
+        if (allowedSkills === null || allowedSkills.includes(skillDir)) {
+          const dstDir = path.join(skillsDst, skillDir);
+          if (!fs.existsSync(dstDir)) {
+            fs.cpSync(srcDir, dstDir, { recursive: true });
+          }
+        }
+      }
+    }
+  } else if (!isMain) {
+    // Legacy workers (no agentType): just sync bundled skills into shared session
+    if (fs.existsSync(bundledSkillsSrc)) {
+      fs.mkdirSync(skillsDst, { recursive: true });
+      for (const skillDir of fs.readdirSync(bundledSkillsSrc)) {
+        const srcDir = path.join(bundledSkillsSrc, skillDir);
+        if (!fs.statSync(srcDir).isDirectory()) continue;
+        const dstDir = path.join(skillsDst, skillDir);
+        fs.cpSync(srcDir, dstDir, { recursive: true });
+      }
     }
   }
+
+  // Copy scripts from parent session so skill JS files are available
+  if (!isMain && group.agentType && parentSessionFolder) {
+    const parentScripts = path.join(
+      DATA_DIR,
+      'sessions',
+      parentSessionFolder,
+      '.claude',
+      'scripts',
+    );
+    const workerScripts = path.join(groupSessionsDir, 'scripts');
+    if (fs.existsSync(parentScripts)) {
+      fs.mkdirSync(workerScripts, { recursive: true });
+      fs.cpSync(parentScripts, workerScripts, { recursive: true });
+    }
+  }
+
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
     readonly: false,
   });
+
+  if (isMain) {
+    // Brain: mount empty skills (prevent SDK auto-discovery — brain dispatches, never executes)
+    const emptySkillsDir = path.join(DATA_DIR, 'brain-empty-skills');
+    fs.mkdirSync(emptySkillsDir, { recursive: true });
+    mounts.push({
+      hostPath: emptySkillsDir,
+      containerPath: '/home/node/.claude/skills',
+      readonly: true,
+    });
+
+    // Brain: readonly mount of all agent memory directories for cross-agent awareness
+    const agentsMemoryDir = path.join(GROUPS_DIR, 'agents');
+    if (fs.existsSync(agentsMemoryDir)) {
+      mounts.push({
+        hostPath: agentsMemoryDir,
+        containerPath: '/workspace/agents',
+        readonly: true,
+      });
+    }
+  } else if (group.agentType) {
+    // Worker: mount this agent's persistent memory as writable
+    const agentMemoryDir = path.join(GROUPS_DIR, 'agents', group.agentType);
+    fs.mkdirSync(agentMemoryDir, { recursive: true });
+    mounts.push({
+      hostPath: agentMemoryDir,
+      containerPath: '/workspace/agent-memory',
+      readonly: false,
+    });
+  }
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -169,15 +414,33 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+
+  // Thread groups: copy parent's attachments into the thread IPC dir
+  // (symlinks don't work inside Apple Container — they point to absolute
+  // host paths outside the container's VirtioFS mounts, and nested mounts
+  // are not supported either).
+  if (threadFolderMatch) {
+    const parentIpcDir = resolveGroupIpcPath(threadFolderMatch[1]);
+    const parentAttachments = path.join(parentIpcDir, 'attachments');
+    const threadAttachments = path.join(groupIpcDir, 'attachments');
+    if (fs.existsSync(parentAttachments)) {
+      // Remove stale symlink if present, then copy actual files
+      try {
+        fs.rmSync(threadAttachments, { recursive: true, force: true });
+      } catch {}
+      fs.cpSync(parentAttachments, threadAttachments, { recursive: true });
+    }
+  }
+
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
     readonly: false,
   });
 
-  // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
+  // Sync agent-runner source on every container startup to prevent stale code.
+  // Previous approach only copied when dir didn't exist, causing subtle bugs
+  // when agent-runner code was updated but containers ran old versions.
   const agentRunnerSrc = path.join(
     projectRoot,
     'container',
@@ -190,7 +453,8 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+  if (fs.existsSync(agentRunnerSrc)) {
+    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
@@ -215,6 +479,7 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  isMain: boolean,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -228,14 +493,51 @@ function buildContainerArgs(
   );
 
   // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
   const authMode = detectAuthMode();
   if (authMode === 'api-key') {
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Pass model override so the SDK inside the container uses the configured model
+  const {
+    CLAUDE_MODEL: modelOverride,
+    GMI_API_KEY: gmiKey,
+    TIKHUB_API_KEY: tikhubKey,
+    GITHUB_TOKEN: ghToken,
+    LATE_API_KEY: lateKey,
+  } = readEnvFile([
+    'CLAUDE_MODEL',
+    'GMI_API_KEY',
+    'TIKHUB_API_KEY',
+    'GITHUB_TOKEN',
+    'LATE_API_KEY',
+  ]);
+  const claudeModel = process.env.CLAUDE_MODEL || modelOverride;
+  if (claudeModel) {
+    args.push('-e', `CLAUDE_MODEL=${claudeModel}`);
+  }
+
+  // Expose API keys for skills that call external services directly
+  const gmiApiKey = process.env.GMI_API_KEY || gmiKey;
+  if (gmiApiKey) {
+    args.push('-e', `GMI_API_KEY=${gmiApiKey}`);
+  }
+
+  const tikhubApiKey = process.env.TIKHUB_API_KEY || tikhubKey;
+  if (tikhubApiKey) {
+    args.push('-e', `TIKHUB_API_KEY=${tikhubApiKey}`);
+  }
+
+  const githubToken = process.env.GITHUB_TOKEN || ghToken;
+  if (githubToken) {
+    args.push('-e', `GITHUB_TOKEN=${githubToken}`);
+  }
+
+  const lateApiKey = process.env.LATE_API_KEY || lateKey;
+  if (lateApiKey) {
+    args.push('-e', `LATE_API_KEY=${lateApiKey}`);
   }
 
   // Runtime-specific args for host gateway resolution
@@ -247,7 +549,14 @@ function buildContainerArgs(
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
+    if (isMain) {
+      // Main containers start as root so the entrypoint can mount --bind
+      // to shadow .env. Privileges are dropped via setpriv in entrypoint.sh.
+      args.push('-e', `RUN_UID=${hostUid}`);
+      args.push('-e', `RUN_GID=${hostGid}`);
+    } else {
+      args.push('--user', `${hostUid}:${hostGid}`);
+    }
     args.push('-e', 'HOME=/home/node');
   }
 
@@ -272,13 +581,21 @@ export async function runContainerAgent(
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
+  // Override assistantName with agent-specific name for workers
+  if (!input.isMain && group.agentType) {
+    const agentDisplayName = getAgentName(group);
+    if (agentDisplayName) {
+      input.assistantName = agentDisplayName;
+    }
+  }
+
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, input.isMain);
 
   logger.debug(
     {
@@ -382,7 +699,9 @@ export async function runContainerAgent(
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
-        if (line) logger.debug({ container: group.folder }, line);
+        if (line && line.includes('[agent-runner]'))
+          logger.info({ container: group.folder }, line);
+        else if (line) logger.debug({ container: group.folder }, line);
       }
       // Don't reset timeout on stderr — SDK writes debug logs continuously.
       // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
