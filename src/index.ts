@@ -18,7 +18,6 @@ import {
 } from './channels/registry.js';
 import {
   ContainerOutput,
-  ImageAttachment,
   runContainerAgent,
   syncWorkerSkillsBack,
   writeGroupsSnapshot,
@@ -447,7 +446,6 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-  imageAttachments?: ImageAttachment[],
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -509,7 +507,6 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
-        ...(imageAttachments?.length ? { imageAttachments } : {}),
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -698,6 +695,7 @@ async function main(): Promise<void> {
         if (parent && (hasTrigger || !parentNeedsTrigger)) {
           const threadTs = chatJid.split(':t:')[1];
           const threadFolder = `${parent.folder}_t_${threadTs.replace('.', '_')}`;
+          storeChatMetadata(chatJid, new Date().toISOString(), `${parent.name} thread`, 'slack', false);
           registerGroup(chatJid, {
             name: `${parent.name} thread`,
             folder: threadFolder,
